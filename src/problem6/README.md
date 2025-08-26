@@ -61,8 +61,6 @@ sequenceDiagram
     BackendAPI->>BackendAPI: Validate request (auth, role, input)
     BackendAPI->>BullMQQueue: Enqueue "UpdateScore" event { userId, points, mutatedBy }
     BullMQQueue-->>Worker: Deliver job
-    Worker->>Database: Fetch current score
-    Database-->>Worker: Return oldScore
     Worker->>Database: Update user score (atomic increment)
     Database-->>Worker: Return newScore
     Worker->>Database: Insert log into score_activity { oldScore, newScore, mutatedBy, timestamp }
@@ -187,11 +185,27 @@ await scoreQueue.add("UpdateScore", { userId, points, mutatedBy });
 
 ```ts
 scoreQueue.process("UpdateScore", async (job) => {
-  const { userId, points, mutatedBy } = job.data;
-  // 1. Fetch old score
-  // 2. Update DB atomically
-  // 3. Log into score_activity
-  // 4. Update Redis leaderboard
+    const { userId, points, mutatedBy } = job.data;
+
+    // 1. Fetch old score
+    //    - Read the current score from the users table.
+    //    - This is needed so we can log the old value into score_activity for auditing.
+    //    - If the user doesn’t exist, fail the job (invalid request).
+
+    // 2. Update DB atomically
+    //    - Use Postgres’ "UPDATE users SET score = score + X" which is safe because of MVCC.
+    //    - Postgres guarantees atomic increments at the row level (no explicit locks required).
+    //    - Even under heavy concurrency, each update is serialized correctly by Postgres.
+
+    // 3. Log into score_activity
+    //    - Insert a record that includes: userId, oldScore, newScore, mutatedBy, and timestamp.
+    //    - This ensures every change (by user or admin) is auditable and traceable.
+    //    - Helps detect malicious actions or admin abuse later.
+
+    // 4. Update Redis leaderboard
+    //    - Push the new score into a Redis ZSET ("leaderboard") with ZADD.
+    //    - Always use ZREVRANGE to fetch top scorers (since higher score = higher rank).
+    //    - This keeps the leaderboard fast (O(log N) updates, O(log N + M) for top queries).
 });
 ```
 
@@ -256,7 +270,7 @@ To further reduce the risk of malicious score mutations, we introduce an additio
       ```
 
 2. **Session Validation**
-    - On every score update request, the backend validates the incoming `deviceId` (if mobile) and/or `IP` against the stored session hash.
+    - On every score update request, the backend validates the incoming `deviceId` (if mobile) or `IP` against the stored session hash.
     - If they match → request proceeds.
     - If they differ → the user must log in again to re-establish a trusted session.
 
